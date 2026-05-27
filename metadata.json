@@ -1,0 +1,10 @@
+{
+  "name": "Realtime Internal Medicine Scribe",
+  "description": "Live dictation demo using AssemblyAI realtime streaming and Gemini API for SOAP note generation.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
