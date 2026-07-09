@@ -14,22 +14,37 @@ const INITIAL_SOAP_STATE = {
   open_questions: [] as string[]
 };
 
+type LatencyMetrics = {
+  tokenMs: number | null;
+  wsConnectMs: number | null;
+  timeToFirstTextMs: number | null;
+  turnLatenciesMs: number[];
+};
+
+const INITIAL_METRICS: LatencyMetrics = {
+  tokenMs: null,
+  wsConnectMs: null,
+  timeToFirstTextMs: null,
+  turnLatenciesMs: [],
+};
+
 export default function ScribeDemo() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isFinalizing, setIsFinalizing] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  
+  const [metrics, setMetrics] = useState<LatencyMetrics>(INITIAL_METRICS);
+
   // Transcript state
   const [finalizedChunks, setFinalizedChunks] = useState<string[]>([]);
   const [partialChunk, setPartialChunk] = useState("");
-  
+
   // SOAP state
   const [soapState, setSoapState] = useState(INITIAL_SOAP_STATE);
   const soapStateRef = useRef(soapState);
-  
+
   const scrollRef = useRef<HTMLDivElement>(null);
-  
+
   // Audio & WebSocket refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -37,6 +52,11 @@ export default function ScribeDemo() {
   const streamRef = useRef<MediaStream | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const updateQueueRef = useRef<Promise<void>>(Promise.resolve());
+
+  // Latency instrumentation refs
+  const wsOpenAtRef = useRef<number | null>(null);
+  const firstTextReceivedRef = useRef(false);
+  const lastAudioSentAtRef = useRef<number | null>(null);
 
   // Keep ref synchronized with state to ensure the updateQueue always uses the latest state
   useEffect(() => {
@@ -59,7 +79,7 @@ export default function ScribeDemo() {
 
   const triggerSoapUpdate = (newChunk: string) => {
     setIsUpdating(true);
-    
+
     // Process updates strictly sequentially so we don't overwrite changes
     updateQueueRef.current = updateQueueRef.current.then(async () => {
         try {
@@ -82,7 +102,7 @@ export default function ScribeDemo() {
         }
     }).finally(() => {
         setIsUpdating((prev) => {
-             // Ideally we'd only set this to false if the queue is fully drained, 
+             // Ideally we'd only set this to false if the queue is fully drained,
              // but setting it false after each task is generally fine for UI indicators.
              return false;
         });
@@ -120,31 +140,68 @@ export default function ScribeDemo() {
   const startRecording = async () => {
     try {
         setErrorMsg(null);
-        const response = await fetch('/api/token');
-        const data = await response.json();
-        const token = data.token;
+        setMetrics(INITIAL_METRICS);
+        firstTextReceivedRef.current = false;
+        lastAudioSentAtRef.current = null;
 
+        // Parallel: mic permission + token (saves ~500ms+ perceived startup)
+        const tokenStart = performance.now();
+        const [tokenRes, stream] = await Promise.all([
+            fetch('/api/token'),
+            navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+            }),
+        ]);
+        const data = await tokenRes.json();
+        setMetrics((m) => ({ ...m, tokenMs: Math.round(performance.now() - tokenStart) }));
+
+        const token = data.token;
         if (!token || data.error) {
-            setErrorMsg('Missing AssemblyAI API Key. Please add ASSEMBLYAI_API_KEY to your AI Studio secrets.');
+            stream.getTracks().forEach((t) => t.stop());
+            setErrorMsg('Missing AssemblyAI API Key. Please add ASSEMBLYAI_API_KEY to your environment.');
             return;
         }
 
+        streamRef.current = stream;
+        setIsPlaying(true);
+
         // Connect to AssemblyAI Universal-Streaming v3.
         // format_turns=true returns punctuated/cased text on end-of-turn messages.
+        const wsConnectStart = performance.now();
         const wsUrl = `wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&token=${token}&format_turns=true`;
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
-        ws.onopen = async () => {
-            setIsPlaying(true);
-            
-            // Request microphone permissions and stream audio
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            streamRef.current = stream;
+        const commitTurn = (transcript: string) => {
+            const trimmed = transcript.trim();
+            if (!trimmed) return;
 
-            // Use Web Audio API to process raw audio
-            const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
-            const context = new AudioContext({ sampleRate: 16000 });
+            const turnLatencyMs = lastAudioSentAtRef.current
+                ? Math.round(performance.now() - lastAudioSentAtRef.current)
+                : null;
+
+            setPartialChunk('');
+            setFinalizedChunks(prev => [...prev, trimmed]);
+            triggerSoapUpdate(trimmed);
+
+            if (turnLatencyMs !== null) {
+                setMetrics((m) => ({
+                    ...m,
+                    turnLatenciesMs: [...m.turnLatenciesMs, turnLatencyMs],
+                }));
+            }
+        };
+
+        ws.onopen = () => {
+            wsOpenAtRef.current = performance.now();
+            setMetrics((m) => ({
+                ...m,
+                wsConnectMs: Math.round(wsOpenAtRef.current! - wsConnectStart),
+            }));
+
+            // Set up the Web Audio pipeline on the already-captured stream.
+            const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+            const context = new AudioCtx({ sampleRate: 16000 });
             audioContextRef.current = context;
 
             const source = context.createMediaStreamSource(stream);
@@ -169,6 +226,7 @@ export default function ScribeDemo() {
                 }
 
                 if (ws.readyState === WebSocket.OPEN) {
+                    lastAudioSentAtRef.current = performance.now();
                     ws.send(pcm16.buffer);
                 }
             };
@@ -185,26 +243,32 @@ export default function ScribeDemo() {
                 console.log('AssemblyAI Universal-Streaming session started:', res.id);
             } else if (res.type === 'Turn') {
                 const transcript: string = res.transcript || '';
+
+                if (transcript && !firstTextReceivedRef.current && wsOpenAtRef.current) {
+                    firstTextReceivedRef.current = true;
+                    setMetrics((m) => ({
+                        ...m,
+                        timeToFirstTextMs: Math.round(performance.now() - wsOpenAtRef.current!),
+                    }));
+                }
+
                 if (!res.end_of_turn) {
                     setPartialChunk(transcript);
                 } else if (res.turn_is_formatted) {
-                    setPartialChunk('');
-                    if (transcript) {
-                        setFinalizedChunks(prev => [...prev, transcript]);
-                        triggerSoapUpdate(transcript);
-                    }
+                    commitTurn(transcript);
                 }
             } else if (res.type === 'Termination') {
                 console.log('AssemblyAI session terminated');
             } else if (res.error) {
                 console.error('AssemblyAI Error:', res.error);
+                setErrorMsg(res.error);
             }
         };
 
         ws.onerror = (e) => console.error("WS Error", e);
         ws.onclose = () => {
            setIsPlaying(false);
-           stopRecording(); // Cleanup
+           stopRecording();
         };
 
     } catch (e) {
@@ -219,6 +283,9 @@ export default function ScribeDemo() {
     setIsPlaying(false);
     setPartialChunk("");
     if (wsRef.current) {
+        if (wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: 'Terminate' }));
+        }
         wsRef.current.close();
         wsRef.current = null;
     }
@@ -245,12 +312,17 @@ export default function ScribeDemo() {
     setFinalizedChunks([]);
     setPartialChunk("");
     setSoapState(INITIAL_SOAP_STATE);
+    setMetrics(INITIAL_METRICS);
   };
+
+  const avgTurnLatency = metrics.turnLatenciesMs.length
+    ? Math.round(metrics.turnLatenciesMs.reduce((a, b) => a + b, 0) / metrics.turnLatenciesMs.length)
+    : null;
 
 
   return (
     <div className="min-h-screen bg-slate-950 font-sans text-slate-200 selection:bg-sky-500/30 overflow-x-hidden">
-      
+
       {/* Navbar */}
       <header className="sticky top-0 z-10 flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-slate-900/50 backdrop-blur-md">
         <div className="flex items-center gap-4">
@@ -303,7 +375,7 @@ export default function ScribeDemo() {
       {/* Main Layout */}
       <main className="w-full max-w-7xl mx-auto p-4 md:p-6 lg:p-8">
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 min-h-[600px]">
-          
+
           {/* Left Panel: Live Transcript */}
           <section className="xl:col-span-5 flex flex-col bg-slate-900/80 rounded-xl border border-slate-800 overflow-hidden shadow-2xl h-full max-h-[800px]">
             <div className="px-5 py-4 border-b border-slate-800 flex justify-between items-center bg-slate-900">
@@ -323,7 +395,7 @@ export default function ScribeDemo() {
                 </div>
               )}
             </div>
-            
+
             <div className="flex-1 relative overflow-hidden">
               <ScrollArea className="h-[400px] lg:h-[600px] p-5">
                 <div ref={scrollRef} className="space-y-4 pb-20">
@@ -339,20 +411,12 @@ export default function ScribeDemo() {
                       </motion.p>
                     ))}
                   </AnimatePresence>
-                  
+
                   {partialChunk && (
-                    <motion.p
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      className="text-slate-500 leading-relaxed text-sm italic animate-pulse"
-                    >
+                    <p className="text-slate-400 leading-relaxed text-sm">
                       {partialChunk}
-                      <motion.span
-                        animate={{ opacity: [1, 0, 1] }}
-                        transition={{ repeat: Infinity, duration: 1 }}
-                        className="inline-block w-1.5 h-3.5 ml-1 bg-sky-500 align-middle"
-                      />
-                    </motion.p>
+                      <span className="inline-block w-1.5 h-3.5 ml-1 bg-sky-500 align-middle animate-pulse" />
+                    </p>
                   )}
 
                   {!isPlaying && finalizedChunks.length === 0 && (
@@ -363,7 +427,7 @@ export default function ScribeDemo() {
                   )}
                 </div>
               </ScrollArea>
-              
+
               {/* Fade out bottom edge */}
               <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-slate-950/80 to-transparent pointer-events-none" />
             </div>
@@ -382,10 +446,10 @@ export default function ScribeDemo() {
                  v2.4 ENGINE
               </div>
             </div>
-            
+
             <div className="flex-1 overflow-hidden relative">
               <ScrollArea className="h-[400px] lg:h-[600px] p-6">
-                
+
                   <div className="space-y-8 pb-12">
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                       <SoapSection title="S" label="Subjective" items={soapState.subjective} colorTheme="sky" />
@@ -396,7 +460,7 @@ export default function ScribeDemo() {
 
                     <AnimatePresence>
                       {soapState.open_questions && soapState.open_questions.length > 0 && (
-                         <motion.div 
+                         <motion.div
                           initial={{ opacity: 0, y: 10 }}
                           animate={{ opacity: 1, y: 0 }}
                           className="mt-4 pt-6 border-t border-slate-800"
@@ -418,7 +482,7 @@ export default function ScribeDemo() {
                   </div>
 
               </ScrollArea>
-              
+
                {isPlaying && (
                   <div className="absolute top-4 right-6 pointer-events-none">
                      <Loader2 className="w-4 h-4 animate-spin text-slate-600" />
@@ -427,6 +491,36 @@ export default function ScribeDemo() {
             </div>
           </section>
         </div>
+
+        {/* Latency Metrics Panel */}
+        <section className="mt-6 bg-slate-900/80 rounded-xl border border-slate-800 overflow-hidden shadow-xl">
+          <div className="px-5 py-4 border-b border-slate-800 flex justify-between items-center bg-slate-900">
+            <h2 className="text-sm font-semibold uppercase tracking-widest text-slate-400 flex items-center gap-2">
+              <Activity className="w-4 h-4 text-emerald-500" />
+              AssemblyAI STT Latency
+            </h2>
+            <span className="text-[10px] font-mono text-slate-500">Universal-Streaming v3 · 16 kHz raw PCM · server-side turn formatting</span>
+          </div>
+          <div className="p-5 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+            <MetricCard label="Token mint" value={metrics.tokenMs} unit="ms" hint="Server → AssemblyAI API" />
+            <MetricCard label="WS connect" value={metrics.wsConnectMs} unit="ms" hint="Socket open time" />
+            <MetricCard label="Time to 1st text" value={metrics.timeToFirstTextMs} unit="ms" hint="TTFT after WS open" highlight />
+            <MetricCard label="Avg turn latency" value={avgTurnLatency} unit="ms" hint="Last audio → turn finalize" />
+            <MetricCard label="Turns finalized" value={metrics.turnLatenciesMs.length} unit="" hint="Formatted end-of-turn events" />
+          </div>
+          {metrics.turnLatenciesMs.length > 0 && (
+            <div className="px-5 pb-4">
+              <p className="text-[10px] uppercase tracking-wider text-slate-500 mb-2">Per-turn latency (ms)</p>
+              <div className="flex flex-wrap gap-1.5">
+                {metrics.turnLatenciesMs.map((ms, i) => (
+                  <span key={i} className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-950/50 text-emerald-400 border border-emerald-500/20">
+                    T{i + 1}: {ms}ms
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
 
         {/* Architecture Notes */}
         <footer className="mt-8">
@@ -439,13 +533,31 @@ export default function ScribeDemo() {
             <div>
                <h5 className="text-xs font-bold text-sky-200 uppercase tracking-wide">Architecture Notes</h5>
                <p className="text-sm text-sky-400/80 mt-1.5 leading-relaxed">
-                 Each finalized transcript chunk acts as an event that incrementally updates structured clinical state. audio is streamed continuously via WebSockets to AssemblyAI's <span className="text-sky-300 font-mono text-xs">Universal-1</span> model. When a chunk finalizes, it triggers a background LLM process to dynamically patch the JSON object without disrupting the live audio flow.
+                 Each finalized transcript chunk acts as an event that incrementally updates structured clinical state. Audio is streamed continuously via WebSockets to AssemblyAI&apos;s <span className="text-sky-300 font-mono text-xs">Universal-Streaming</span> model. When a turn finalizes, it triggers a background LLM process to dynamically patch the JSON object without disrupting the live audio flow.
                </p>
             </div>
           </div>
         </footer>
 
       </main>
+    </div>
+  );
+}
+
+function MetricCard({ label, value, unit, hint, highlight }: {
+  label: string;
+  value: number | null;
+  unit: string;
+  hint: string;
+  highlight?: boolean;
+}) {
+  return (
+    <div className={`rounded-lg border p-3 ${highlight ? 'border-emerald-500/30 bg-emerald-950/20' : 'border-slate-800 bg-slate-950/40'}`}>
+      <p className="text-[10px] uppercase tracking-wider text-slate-500">{label}</p>
+      <p className={`text-xl font-semibold mt-1 font-mono ${highlight ? 'text-emerald-400' : 'text-slate-200'}`}>
+        {value !== null ? `${value}${unit ? unit : ''}` : '—'}
+      </p>
+      <p className="text-[10px] text-slate-600 mt-1">{hint}</p>
     </div>
   );
 }
@@ -457,11 +569,11 @@ function SoapSection({ title, label, items, colorTheme }: { title: string; label
     purple: "text-purple-400 bg-purple-400/10 border-purple-500/50",
     amber: "text-amber-400 bg-amber-400/10 border-amber-500/50",
   };
-  
+
   const [textColor, bgColor, borderColor] = themes[colorTheme].split(' ');
-  
+
   return (
-    <motion.div 
+    <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       className="space-y-3"
