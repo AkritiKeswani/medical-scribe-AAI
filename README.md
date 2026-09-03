@@ -100,6 +100,29 @@ npm run dev
 
 Then open <http://localhost:3000>, click **Start Recording**, and start talking through a mock patient encounter.
 
+## Deploying on Ryvn
+
+Create a **Server** service from this GitHub repository and choose **Dockerfile** as the build method. Use these installation settings:
+
+- Branch: `main`
+- Dockerfile: `./Dockerfile`
+- Port: `3000`
+- Health check path: `/healthz`
+- Sensitive environment variables: `ASSEMBLYAI_API_KEY` and `GEMINI_API_KEY`
+- Optional environment variable: `APP_URL` set to the public service URL
+
+The image runs as a non-root user, honors Ryvn's runtime `PORT` override, and uses Next.js standalone output. API keys are read only at runtime and are excluded from the Docker build context.
+
+To test the image locally:
+
+```bash
+docker build -t medical-scribe .
+docker run --rm -p 3000:3000 \
+  -e ASSEMBLYAI_API_KEY=your_key \
+  -e GEMINI_API_KEY=your_key \
+  medical-scribe
+```
+
 ## Project layout
 
 ```
